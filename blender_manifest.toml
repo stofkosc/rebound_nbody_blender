@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "rebound_nbody"
+version = "1.0.0"
+name = "REBOUND N-body"
+tagline = "N-body simulations with REBOUND: bake, trails, orbits, swarms"
+maintainer = "Peter"
+type = "add-on"
+
+blender_version_min = "4.4.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Animation", "Physics"]
+
+[permissions]
+network = "Install REBOUND with pip and query NASA JPL Horizons"
+files = "Export trajectories and REBOUND SimulationArchives"
