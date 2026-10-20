@@ -150,7 +150,9 @@ def _settings(scene, **kw):
     defaults = dict(units="CODE", G=1.0, integrator="ias15", dt_mode="AUTO", dt_fraction=0.02,
                     move_to_com=True, collision="none", frame_mode="INERTIAL", anchor_frame=True,
                     length_scale=1.0, trails=True, trail_length=0, orbits=False, exact_mode="AUTO",
-                    frame_center=None, frame_secondary=None)
+                    frame_center=None, frame_secondary=None, duration_mode="FRAMES",
+                    sampling_mode="TIMELINE", duration_body=None, retime_mode="ONE_TO_ONE",
+                    retime_use_window=False)
     defaults.update(kw)
     for k, v in defaults.items():
         setattr(s, k, v)

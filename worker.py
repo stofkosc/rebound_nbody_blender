@@ -63,6 +63,7 @@ def main():
             halted=np.bool_(runner.halted),
             wall=np.float64(runner.wall),
             messages=np.array(runner.messages, dtype=object),
+            messages_json=np.array(json.dumps(runner.messages)),
             archive_error=np.array(runner.archive_error or ""),
         )
         if runner.spos is not None:

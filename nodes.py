@@ -2,7 +2,7 @@
 
 import bpy
 
-NODES_VERSION = 3
+NODES_VERSION = 4
 
 TRAIL_GROUP = "REBOUND Trail"
 ORBIT_GROUP = "REBOUND Orbit"
@@ -113,6 +113,7 @@ def ensure_gn_modifier(obj, group, name="REBOUND"):
 def trail_group(force=False):
     ng, fresh = _new_group(TRAIL_GROUP, [
         ("Frame Start", "NodeSocketInt", 1, None, None),
+        ("Frame Step", "NodeSocketFloat", 1.0, 1e-6, None),
         ("Length", "NodeSocketInt", 0, 0, None),
         ("Radius", "NodeSocketFloat", 0.01, 0.0, None),
         ("Fade", "NodeSocketFloat", 1.0, 0.0, 1.0),
@@ -126,8 +127,10 @@ def trail_group(force=False):
     go = b.node("NodeGroupOutput", 900, 0)
     st = b.node("GeometryNodeInputSceneTime", -1400, 300)
     idx = _out(b.node("GeometryNodeInputIndex", -1400, 450), "Index")
-    L = gi.outputs["Length"]
-    cur = b.math("SUBTRACT", _out(st, "Frame"), gi.outputs["Frame Start"], -1200, 300)
+    step = b.math("MAXIMUM", gi.outputs["Frame Step"], 1e-6, -1300, 200)
+    L = b.math("DIVIDE", gi.outputs["Length"], step, -1150, 450)
+    cur = b.math("DIVIDE", b.math("SUBTRACT", _out(st, "Frame"), gi.outputs["Frame Start"], -1250, 300),
+                 step, -1100, 300)
 
     # fade value f in [0,1] along the visible part (computed before trimming)
     denom = b.math("ADD", L, b.math("MULTIPLY", b.math("LESS_THAN", L, 0.5, -1000, 600),

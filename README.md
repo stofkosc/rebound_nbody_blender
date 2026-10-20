@@ -17,7 +17,32 @@ Tested headlessly with **Blender 5.2.2 LTS + REBOUND 5.2.2** (also supports Blen
 1. Pick a preset → **Load** → **Bake Simulation** → press Play.
 2. Or build your own: **Add Body** (first = star, then planets with orbital elements), or select any objects → **Make Selected Bodies**.
 3. Turn on **Live Preview** to see the predicted paths and velocity arrows update as you drag bodies or change values.
-4. Bodies are locked after baking. Use **Clear Bake** (trash icon) to edit initial conditions again.
+4. Every bake is stored in **Bake History & External** (and saved as a `.npz` file in `//rebound_bakes/`). You can tweak parameters and bake new iterations without losing previous simulations, click any saved bake in the list to preview it, or click **Restore Setup** to branch a new simulation from an older bake's initial conditions. Use **Unbake Viewport** (loop-back icon) when you want to drag Cartesian bodies in the 3D viewport again.
+
+## Bake History & External / Cluster Simulations
+
+### Managing multiple bakes in Blender
+- **Persistent Bake History**: Each bake is automatically recorded in the **Bake History & External** panel and saved to `//rebound_bakes/*.npz` alongside your `.blend` file.
+- **Instant Switching & Comparison**: Click any bake (or its radio button) in the history list to immediately load its trajectories, trails, osculating orbits, swarm point clouds, and Graph Editor diagnostics into the viewport. Double-click a bake's name to rename it.
+- **Iterate Without Losing Work**: Edit body parameters (mass, orbital elements, velocity, initial location) or simulation settings directly and click **Bake Simulation** to add a new iteration, or click **Restore Setup** on any historical bake to revert the scene's initial conditions to that run.
+- **Re-project Visualization Instantly**: Change Reference Frame (Inertial, Centred, Co-rotating), Length Scale, Trails, or Osculating Orbits and click **Update Visualization** to re-compute all keyframes and geometry from the active bake without re-running REBOUND.
+
+### Running simulations outside Blender (University / HPC Clusters)
+`core.py`, `worker.py`, and `cli.py` are **100% pure Python + NumPy + REBOUND** (no `bpy` dependency) and include the full multicore swarm parallelization and scientific split-drift verification.
+
+1. **Export Setup from Blender**: Set up or prototype your system in Blender and click **Export Spec (.json)** in the *Bake History & External* panel.
+2. **Run on Cluster / Server**: Copy `core.py`, `worker.py`, `cli.py`, and your `.json` spec to the remote machine (requires only `pip install rebound numpy`) and run:
+   ```bash
+   # Run across 32 CPU worker processes (or -w 0 for auto CPU detection):
+   python cli.py my_system.json -o cluster_run.npz --workers 32
+
+   # Scale up particle count and frame count on the cluster:
+   python cli.py my_system.json -o hires_disk.npz -w 32 --swarm-count 50000 --frames 2000 --label "Disk 50k"
+
+   # Or convert a native REBOUND SimulationArchive (.bin) from any custom script:
+   python cli.py --from-archive archive.bin -o archive_bake.npz
+   ```
+3. **Import & Interpret in Blender**: Copy the `.npz` (or `.bin` `SimulationArchive`) file back to your computer and click **Import (.npz / .bin)** (or place `.npz` files into `//rebound_bakes/` and click **Scan Folder**). The add-on automatically creates or links the bodies and swarm meshes, writes keyframes, trails, and osculating ellipses, and lets you switch reference frames or inspect orbital elements in the Graph Editor.
 
 ## Presets
 
@@ -33,7 +58,10 @@ Tested headlessly with **Blender 5.2.2 LTS + REBOUND 5.2.2** (also supports Blen
 ## Main settings
 
 - **Simulation**: unit system (code units with your own G, AU/yr/2π/Msun with G = 1, AU/yr, AU/day, SI), integrator (IAS15, WHFast, MERCURIUS, TRACE, SABA, Leapfrog, JANUS, BS) with REBOUND's own description shown in the panel, automatic timestep (a fraction of the shortest orbital period) or a manual one, collisions (merge / bounce / stop), and **Parallel Swarm Bake** (splits massless test-particle swarms across multiple CPU worker processes, with a toggle to disable for strict single-process runs).
-- **Time**: *Time per Frame* maps simulation time to frames. In a body's settings, **Fit Timeline to Orbits** sets it so the frame range covers N orbits of that body.
+- **Time & Retiming**:
+  - **Scientific Duration Setup (Before Bake)**: Choose duration by *Timeline Frames*, *Orbital Periods* (N orbits of a reference body or shortest bound orbit), or *Physical Time* (Simulation Units, Years `yr`, Kiloyears `kyr`, Megayears `Myr`, Days `d`, Seconds `s`).
+  - **Sampling Cadence**: Record one snapshot per timeline frame, a fixed total number of snapshots, *N snapshots per reference orbit* (e.g. `30` for smooth trajectories or `1` for stroboscopic resonance maps), or a fixed $\Delta t$.
+  - **Post-Bake Retiming & Time Window**: After baking (or importing an external simulation), map the stored snapshots to *1 Snapshot = 1 Frame*, *Fit to Total Frames*, *Frames per Orbit* (e.g. `60` frames per reference period), or *Frames per Time Unit*, and optionally slice a `[Start, End]` time window — then click **Apply Retiming to Active Bake** (`Update Visualization`) with zero extra `.npz` disk usage.
 - **Visualization**: length scale (Blender units per length unit), reference frame (inertial, centred on a body, or co-rotating with a pair), trails (length, fade, taper, glow), osculating ellipses.
 - **Data & Diagnostics**:
   - a, e and inclination keyframed as custom properties `rb_a`, `rb_e`, `rb_inc` on each body (plot them in the Graph Editor)

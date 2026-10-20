@@ -220,19 +220,30 @@ class REBOUND_OT_export_csv(bpy.types.Operator, ExportHelper):
 
     def execute(self, context):
         scene = context.scene
-        rb = deps.get_rebound()
-        if rb is None:
-            self.report({"ERROR"}, "REBOUND is not installed.")
-            return {"CANCELLED"}
-        try:
-            spec, bodies, swarms, _slots = scene_io.make_spec(scene)
-            sig = bake.spec_signature(spec)
-            runner = bake.LAST["runner"] if bake.LAST["sig"] == sig else None
-            if runner is None:
-                runner = core.Runner(rb, spec).run()
-        except core.SetupError as ex:
-            self.report({"ERROR"}, str(ex))
-            return {"CANCELLED"}
+        s = scene.rebound
+        runner = None
+        if s.baked:
+            runner = bake.LAST.get("runner")
+            if runner is None and 0 <= s.active_bake_index < len(s.bakes):
+                try:
+                    runner, _meta = bake.get_entry_run(s.bakes[s.active_bake_index])
+                except Exception:
+                    runner = None
+        if runner is None:
+            rb = deps.get_rebound()
+            if rb is None:
+                self.report({"ERROR"}, "REBOUND is not installed.")
+                return {"CANCELLED"}
+            try:
+                spec, _bodies, _swarms, _slots = scene_io.make_spec(scene)
+                sig = bake.spec_signature(spec)
+                runner = bake.LAST["runner"] if bake.LAST["sig"] == sig else None
+                if runner is None:
+                    runner = core.Runner(rb, spec).run()
+            except core.SetupError as ex:
+                self.report({"ERROR"}, str(ex))
+                return {"CANCELLED"}
+        body_names = [b.name for b in sorted(runner.spec.bodies, key=lambda x: x.slot)]
         rel = runner.relative_energy_error()
         with open(self.filepath, "w", newline="") as fh:
             w = csv.writer(fh)
@@ -240,11 +251,12 @@ class REBOUND_OT_export_csv(bpy.types.Operator, ExportHelper):
                         "rel_energy_error"])
             for k in range(runner.F):
                 fr = scene.frame_start + k
-                for b, obj in enumerate(bodies):
+                for b in range(runner.B):
+                    bname = body_names[b] if b < len(body_names) else f"Body {b + 1}"
                     p, v = runner.bpos[k, b], runner.bvel[k, b]
                     if not np.isfinite(p[0]):
                         continue
-                    w.writerow([fr, f"{runner.times[k]:.17g}", obj.name, *(f"{x:.17g}" for x in p),
+                    w.writerow([fr, f"{runner.times[k]:.17g}", bname, *(f"{x:.17g}" for x in p),
                                 *(f"{x:.17g}" for x in v), f"{runner.bmass[k, b]:.17g}",
                                 f"{runner.brad[k, b]:.17g}",
                                 "" if not np.isfinite(rel[k]) else f"{rel[k]:.6e}"])

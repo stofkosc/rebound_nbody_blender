@@ -3,8 +3,8 @@
 import math
 
 import bpy
-from bpy.props import (BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty,
-                       IntProperty, PointerProperty, StringProperty)
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty,
+                       FloatVectorProperty, IntProperty, PointerProperty, StringProperty)
 
 
 def _dirty(self, context):
@@ -75,6 +75,15 @@ FRAME_MODES = [
     ("CENTERED", "Centred on body", "Positions relative to one body (e.g. heliocentric)"),
     ("COROTATING", "Co-rotating pair", "Frame rotating with two bodies (synodic frame): the "
      "secondary stays on a fixed axis, e.g. to show Lagrange points"),
+]
+
+TIME_UNIT_ITEMS = [
+    ("SIM", "Simulation Units", "Current simulation time unit"),
+    ("YR", "Years (yr)", "Julian years (365.25 days)"),
+    ("KYR", "Kiloyears (kyr)", "1,000 Julian years"),
+    ("MYR", "Megayears (Myr)", "1,000,000 Julian years"),
+    ("DAY", "Days (d)", "Days (86,400 seconds)"),
+    ("SEC", "Seconds (s)", "SI seconds"),
 ]
 
 
@@ -166,6 +175,39 @@ class RB_BodySettings(bpy.types.PropertyGroup):
     initial_scale: FloatVectorProperty(size=3, default=(1, 1, 1), options={"HIDDEN"})
 
 
+def _active_bake_update(self, context):
+    from . import bake
+    if bake.is_suppressing_bake_update():
+        return
+    scene = self.id_data
+    idx = self.active_bake_index
+    if self.auto_preview_bake and 0 <= idx < len(self.bakes):
+        try:
+            bake.load_bake_entry(scene, idx)
+        except Exception:
+            pass
+
+
+class RB_BakeEntry(bpy.types.PropertyGroup):
+    uid: StringProperty(name="UID", default="")
+    name: StringProperty(name="Name", default="Bake",
+                         description="Display name of this stored simulation (double-click to rename)")
+    filepath: StringProperty(name="Bake File", subtype="FILE_PATH", default="",
+                             description="Path to the .npz file storing this simulation")
+    created_at: StringProperty(name="Created", default="")
+    integrator: StringProperty(name="Integrator", default="ias15")
+    n_frames: IntProperty(name="Frames", default=0)
+    n_bodies: IntProperty(name="Bodies", default=0)
+    n_swarm: IntProperty(name="Swarm Particles", default=0)
+    sim_time: FloatProperty(name="Simulated Time", default=0.0)
+    unit_time: StringProperty(name="Time Unit", default="T")
+    energy_error: FloatProperty(name="Energy Error", default=-1.0)
+    split_error: FloatProperty(name="Split Drift", default=-1.0)
+    summary: StringProperty(name="Summary", default="")
+    is_loaded: BoolProperty(name="Loaded", default=False)
+
+
+
 class RB_SceneSettings(bpy.types.PropertyGroup):
     # --- physics
     units: EnumProperty(name="Units", items=UNITS, default="CODE", update=_dirty)
@@ -195,16 +237,76 @@ class RB_SceneSettings(bpy.types.PropertyGroup):
         ("halt", "Stop", "Stop the simulation at the first collision"),
     ], default="merge", update=_dirty)
 
-    # --- time mapping
+    # --- time mapping, scientific duration & retiming
+    duration_mode: EnumProperty(name="Duration By", items=[
+        ("FRAMES", "Timeline Frames", "Simulate for (End Frame - Start Frame) × Time/Snapshot"),
+        ("ORBITS", "Orbital Periods", "Specify how many orbits of a reference body (or shortest orbit) to simulate"),
+        ("TIME", "Physical Time", "Specify total physical or simulation duration (yr, kyr, Myr, days, etc.)"),
+    ], default="FRAMES", update=_dirty)
+    duration_orbits: FloatProperty(
+        name="Orbits", default=10.0, min=1e-4, soft_max=100000.0, precision=3, update=_dirty,
+        description="Number of reference orbital periods to simulate")
+    duration_body: PointerProperty(
+        name="Reference Body", type=bpy.types.Object, poll=_poll_body, update=_dirty,
+        description="Body whose orbital period defines 1 characteristic orbit (empty = shortest bound orbit)")
+    duration_time: FloatProperty(
+        name="Total Time", default=100.0, min=1e-9, precision=4, update=_dirty,
+        description="Total physical or simulation duration in the chosen time unit")
+    duration_unit: EnumProperty(
+        name="Time Unit", items=TIME_UNIT_ITEMS, default="SIM", update=_dirty,
+        description="Unit for Total Time")
+
+    sampling_mode: EnumProperty(name="Sampling", items=[
+        ("TIMELINE", "Timeline Frames", "Record one snapshot per timeline frame (End - Start + 1)"),
+        ("SNAPSHOTS", "Total Snapshots", "Record a chosen total number of evenly spaced snapshots"),
+        ("PER_ORBIT", "Snapshots / Orbit", "Record N snapshots per reference orbital period (e.g. 30 for smooth paths, 1 for stroboscopic resonance maps)"),
+        ("STEP", "Fixed Δt", "Record a snapshot every 'Time / Snapshot' interval"),
+    ], default="TIMELINE", update=_dirty)
+    sample_count: IntProperty(
+        name="Snapshots", default=600, min=2, soft_max=20000, max=500000, update=_dirty,
+        description="Total number of snapshots recorded across the simulation")
+    samples_per_orbit: FloatProperty(
+        name="Snapshots / Orbit", default=30.0, min=0.01, soft_max=500.0, precision=2, update=_dirty,
+        description="Number of recorded snapshots per reference orbital period")
+
     time_per_frame: FloatProperty(name="Time per Frame", default=0.05, min=1e-12, precision=5,
                                   update=_dirty,
-                                  description="Simulation time that passes between two frames")
+                                  description="Simulation time that passes between two recorded snapshots")
     exact_mode: EnumProperty(name="Output Times", items=[
         ("AUTO", "Auto", "Exact for adaptive integrators; for fixed-step integrators the nearest "
                          "step is used so the timestep stays constant (keeps them symplectic)"),
         ("EXACT", "Exact", "Hit every frame time exactly (REBOUND exact_finish_time=1)"),
         ("STEP", "Nearest Step", "Never shorten a step (exact_finish_time=0)"),
     ], default="AUTO", update=_dirty)
+
+    # --- post-bake retiming & timeline fitting
+    retime_mode: EnumProperty(name="Playback Retiming", items=[
+        ("ONE_TO_ONE", "1 Snapshot = 1 Frame", "Each recorded simulation snapshot plays on one consecutive Blender frame"),
+        ("FIT_FRAMES", "Fit to Total Frames", "Stretch or compress the simulation into a target number of Blender timeline frames"),
+        ("FRAMES_PER_ORBIT", "Frames per Orbit", "Set how many Blender frames equal one characteristic orbital period"),
+        ("FRAMES_PER_TIME", "Frames per Time Unit", "Set how many Blender frames equal one physical time unit (e.g. yr, d)"),
+    ], default="ONE_TO_ONE")
+    retime_frames: IntProperty(
+        name="Target Frames", default=300, min=2, soft_max=10000, max=500000,
+        description="Number of Blender timeline frames into which the baked simulation is fitted")
+    retime_frames_per_orbit: FloatProperty(
+        name="Frames / Orbit", default=60.0, min=0.1, soft_max=1000.0, precision=2,
+        description="Number of Blender playback frames per reference orbital period")
+    retime_frames_per_time: FloatProperty(
+        name="Frames / Unit", default=24.0, min=1e-6, soft_max=1000.0, precision=3,
+        description="Number of Blender playback frames per chosen physical time unit")
+    retime_time_unit: EnumProperty(
+        name="Playback Unit", items=TIME_UNIT_ITEMS, default="SIM",
+        description="Physical time unit used for Frames / Unit and Time Window")
+    retime_use_window: BoolProperty(
+        name="Trim Time Window", default=False,
+        description="Map only a selected [Start Time, End Time] sub-interval of the bake onto the Blender timeline")
+    retime_start_time: FloatProperty(
+        name="Window Start", default=0.0, min=0.0, precision=4,
+        description="Start of the playback time window in the selected Playback Unit")
+    retime_end_time: FloatProperty(
+        name="Window End", default=10.0, min=0.0, precision=4,
+        description="End of the playback time window in the selected Playback Unit (0 or <= start uses the end of the bake)")
 
     # --- display
     frame_mode: EnumProperty(name="Reference Frame", items=FRAME_MODES, default="INERTIAL",
@@ -292,6 +394,21 @@ class RB_SceneSettings(bpy.types.PropertyGroup):
                                   description="Epoch, e.g. '2026-01-01 00:00' or 'JD2461041.5'. "
                                               "Empty = now (UTC)")
 
+    # --- bake history & external storage
+    bake_dir: StringProperty(
+        name="Bake Folder", subtype="DIR_PATH", default="//rebound_bakes",
+        description="Directory where baked simulations (.npz) are stored "
+                    "('//' = relative to the .blend file)")
+    save_bakes_to_disk: BoolProperty(
+        name="Save Bakes to Project Folder", default=True,
+        description="Persist every bake as a .npz file in the Bake Folder so you can switch "
+                    "between simulations and keep them across Blender sessions")
+    auto_preview_bake: BoolProperty(
+        name="Load Bake on Select", default=True,
+        description="Immediately preview a saved bake in the viewport when selecting it in the Bake History list")
+    bakes: CollectionProperty(type=RB_BakeEntry, name="Saved Bakes")
+    active_bake_index: IntProperty(name="Active Bake", default=-1, update=_active_bake_update)
+
     # --- status
     baked: BoolProperty(default=False)
     bake_running: BoolProperty(default=False)
@@ -313,7 +430,7 @@ def _preset_items():
     return _PRESET_CACHE
 
 
-classes = (RB_BodySettings, RB_SceneSettings)
+classes = (RB_BodySettings, RB_BakeEntry, RB_SceneSettings)
 
 
 def register_props():

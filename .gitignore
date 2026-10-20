@@ -17,6 +17,7 @@ ENV/
 *.blend2
 *.blend@*
 *.crash.txt
+rebound_bakes/
 
 # OS / Editor files
 .DS_Store

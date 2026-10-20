@@ -5,7 +5,7 @@ import textwrap
 
 import bpy
 
-from . import deps, preview, scene_io
+from . import core, deps, preview, scene_io
 
 
 def _wrap(layout, text, width=48, icon="NONE"):
@@ -29,6 +29,25 @@ class REBOUND_UL_bodies(bpy.types.UIList):
         objs = getattr(data, propname)
         flags = [self.bitflag_filter_item if o.rebound.enabled else 0 for o in objs]
         return flags, []
+
+
+class REBOUND_UL_bakes(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        op = row.operator(
+            "rebound.load_bake",
+            text="",
+            icon="RADIOBUT_ON" if item.is_loaded else "RADIOBUT_OFF",
+            emboss=False,
+        )
+        op.index = index
+        row.prop(item, "name", text="", emboss=False)
+        sub = row.row(align=True)
+        sub.alignment = "RIGHT"
+        tag = f"{item.n_frames}f · {item.n_bodies}b"
+        if item.n_swarm > 0:
+            tag += f"+{item.n_swarm}p"
+        sub.label(text=tag)
 
 
 class _Base:
@@ -56,13 +75,65 @@ class REBOUND_PT_main(_Base, bpy.types.Panel):
             row = col.row(align=True)
             row.scale_y = 1.5
             row.operator("rebound.bake", icon="PHYSICS")
-            row.operator("rebound.clear_bake", text="", icon="TRASH")
+            row.operator("rebound.clear_bake", text="", icon="LOOP_BACK")
         if s.bake_info:
             _wrap(layout.box(), s.bake_info, icon="INFO")
         if s.bake_messages:
             box = layout.box()
             for line in s.bake_messages.splitlines()[:6]:
                 _wrap(box, line, icon="ERROR")
+
+
+class REBOUND_PT_bakes(_Base, bpy.types.Panel):
+    bl_label = "Bake History & External"
+    bl_parent_id = "REBOUND_PT_main"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        s = scene.rebound
+
+        layout.template_list(
+            "REBOUND_UL_bakes", "", s, "bakes", s, "active_bake_index", rows=4
+        )
+
+        row = layout.row(align=True)
+        op = row.operator("rebound.load_bake", text="Preview", icon="PLAY")
+        op.index = -1
+        op_res = row.operator("rebound.restore_bake_setup", text="Restore Setup", icon="LOOP_BACK")
+        op_res.index = -1
+        row.operator("rebound.delete_bake", text="", icon="X")
+
+        if 0 <= s.active_bake_index < len(s.bakes):
+            entry = s.bakes[s.active_bake_index]
+            box = layout.box()
+            col = box.column(align=True)
+            hdr = f"{entry.integrator.upper()}  |  t = {entry.sim_time:.4g} {entry.unit_time}"
+            if entry.created_at:
+                hdr += f"  |  {entry.created_at}"
+            col.label(text=hdr, icon="TIME")
+            if entry.summary:
+                _wrap(col, entry.summary, width=46)
+            if entry.filepath:
+                col.label(text=f"File: {entry.filepath}", icon="FILE")
+
+        col = layout.column(align=True)
+        col.prop(s, "save_bakes_to_disk")
+        col.prop(s, "auto_preview_bake")
+        if s.save_bakes_to_disk:
+            row = col.row(align=True)
+            row.prop(s, "bake_dir", text="Folder")
+            row.operator("rebound.scan_bakes", text="", icon="FILE_REFRESH")
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="External / Cluster Simulations:", icon="NETWORK_DRIVE")
+        row = col.row(align=True)
+        row.operator("rebound.export_spec", text="Export Spec (.json)", icon="EXPORT")
+        row.operator("rebound.import_bake", text="Import (.npz / .bin)", icon="IMPORT")
+        row = col.row(align=True)
+        row.operator("rebound.export_bake", text="Export Bake (.npz)", icon="FILE_TICK")
+        row.operator("rebound.clear_bake_history", text="Clear All", icon="TRASH")
 
 
 class REBOUND_PT_bodies(_Base, bpy.types.Panel):
@@ -94,9 +165,8 @@ def draw_body(layout, obj, scene):
     baked = rb.has_initial
     col = layout.column()
     if baked:
-        col.label(text="Baked: Clear Bake to edit initial conditions", icon="LOCKED")
+        col.operator("rebound.clear_bake", text="Unbake Viewport to Drag in 3D", icon="LOOP_BACK")
     sub = col.column()
-    sub.enabled = not baked or rb.kind == "SWARM"
     sub.prop(rb, "kind", expand=True)
     if rb.kind == "SWARM":
         sub.prop(rb, "primary")
@@ -120,6 +190,8 @@ def draw_body(layout, obj, scene):
     sub.prop(rb, "ic_mode", expand=True)
     if rb.ic_mode == "CARTESIAN":
         sub.label(text=f"Position = location / {s.length_scale:g}", icon="EMPTY_AXIS")
+        if baked:
+            sub.prop(rb, "initial_location", text="Initial Location [Blender]")
         sub.prop(rb, "velocity", text=f"Velocity [{lbl[0]}/{lbl[1]}]")
         sub.operator("rebound.circular_velocity", icon="CURVE_BEZCIRCLE")
         sub.prop(rb, "primary", text="Reference")
@@ -201,7 +273,7 @@ class REBOUND_PT_simulation(_Base, bpy.types.Panel):
 
 
 class REBOUND_PT_time(_Base, bpy.types.Panel):
-    bl_label = "Time"
+    bl_label = "Time & Retiming"
     bl_parent_id = "REBOUND_PT_main"
 
     def draw(self, context):
@@ -211,13 +283,69 @@ class REBOUND_PT_time(_Base, bpy.types.Panel):
         scene = context.scene
         s = scene.rebound
         lbl = scene_io.unit_labels(scene)
-        layout.prop(s, "time_per_frame", text=f"Time / Frame [{lbl[1]}]")
-        row = layout.row(align=True)
-        row.prop(scene, "frame_start", text="Frames")
-        row.prop(scene, "frame_end", text="")
-        total = (scene_io.n_frames(scene) - 1) * s.time_per_frame
-        layout.label(text=f"Total simulated time: {total:.6g} {lbl[1]}")
+
+        # ---- 1. Simulation Duration & Sampling (before bake)
+        col = layout.column()
+        col.prop(s, "duration_mode")
+        if s.duration_mode == "ORBITS":
+            col.prop(s, "duration_orbits")
+            col.prop(s, "duration_body", text="Reference")
+        elif s.duration_mode == "TIME":
+            col.prop(s, "duration_time")
+            col.prop(s, "duration_unit", text="Unit")
+
+        col.prop(s, "sampling_mode")
+        if s.sampling_mode == "SNAPSHOTS":
+            col.prop(s, "sample_count")
+        elif s.sampling_mode == "PER_ORBIT":
+            col.prop(s, "samples_per_orbit")
+            if s.duration_mode != "ORBITS":
+                col.prop(s, "duration_body", text="Reference")
+        elif s.sampling_mode == "STEP" or s.duration_mode == "FRAMES":
+            col.prop(s, "time_per_frame", text=f"Time / Snapshot [{lbl[1]}]")
+
+        if s.duration_mode == "FRAMES" or s.sampling_mode == "TIMELINE":
+            row = col.row(align=True)
+            row.prop(scene, "frame_start", text="Timeline")
+            row.prop(scene, "frame_end", text="")
+
+        nf, tpf, total_t, P_ref = scene_io.resolve_sim_timing(scene)
+        box = layout.box()
+        bcol = box.column(align=True)
+        orb_tag = f"  (≈ {total_t / P_ref:.4g} orbits)" if (P_ref and P_ref > 0) else ""
+        bcol.label(text=f"Duration: {total_t:.5g} {lbl[1]}{orb_tag}", icon="TIME")
+        bcol.label(text=f"Sampling: {nf} snapshots  (Δt = {tpf:.4g} {lbl[1]})")
+        if P_ref and P_ref > 0:
+            ref_lbl = s.duration_body.name if s.duration_body else "shortest orbit"
+            bcol.label(text=f"P_ref ({ref_lbl}) ≈ {P_ref:.5g} {lbl[1]}")
+
         layout.prop(s, "exact_mode")
+
+        # ---- 2. Animation Retiming & Playback Mapping (post-bake)
+        layout.separator()
+        rcol = layout.column()
+        rcol.label(text="Playback Retiming (Post-Bake):", icon="PREVIEW_RANGE")
+        rcol.prop(s, "retime_mode", text="Mode")
+        if s.retime_mode == "FIT_FRAMES":
+            rcol.prop(s, "retime_frames")
+        elif s.retime_mode == "FRAMES_PER_ORBIT":
+            rcol.prop(s, "retime_frames_per_orbit")
+            rcol.prop(s, "duration_body", text="Reference")
+        elif s.retime_mode == "FRAMES_PER_TIME":
+            rcol.prop(s, "retime_frames_per_time")
+            rcol.prop(s, "retime_time_unit", text="Unit")
+
+        rcol.prop(s, "retime_use_window")
+        if s.retime_use_window:
+            if s.retime_mode != "FRAMES_PER_TIME":
+                rcol.prop(s, "retime_time_unit", text="Window Unit")
+            u_lbl = core.time_unit_label(s.units, s.retime_time_unit)
+            wrow = rcol.row(align=True)
+            wrow.prop(s, "retime_start_time", text=f"Start [{u_lbl}]")
+            wrow.prop(s, "retime_end_time", text=f"End [{u_lbl}]")
+
+        rcol.prop(scene, "frame_start", text="Start Frame")
+        rcol.operator("rebound.reapply_bake", text="Apply Retiming to Active Bake", icon="FILE_REFRESH")
 
 
 class REBOUND_PT_view(_Base, bpy.types.Panel):
@@ -253,7 +381,7 @@ class REBOUND_PT_view(_Base, bpy.types.Panel):
         sub.prop(s, "orbit_thickness")
         sub.prop(s, "orbit_resolution")
         layout.prop(s, "scale_with_radius")
-        layout.label(text="Changes apply on the next bake", icon="INFO")
+        layout.operator("rebound.reapply_bake", text="Update Visualization", icon="FILE_REFRESH")
 
 
 class REBOUND_PT_preview(_Base, bpy.types.Panel):
@@ -271,7 +399,7 @@ class REBOUND_PT_preview(_Base, bpy.types.Panel):
         col = layout.column()
         col.active = s.preview_enabled
         if s.baked:
-            col.label(text="Paused while the scene is baked", icon="PAUSE")
+            col.label(text="Paused while viewing a bake (Unbake to preview)", icon="PAUSE")
         col.prop(s, "preview_frames")
         col.prop(s, "preview_velocity")
         if s.preview_velocity:
@@ -349,6 +477,6 @@ class REBOUND_PT_object(bpy.types.Panel):
         draw_body(self.layout, obj, context.scene)
 
 
-classes = (REBOUND_UL_bodies, REBOUND_PT_main, REBOUND_PT_bodies, REBOUND_PT_simulation,
-           REBOUND_PT_time, REBOUND_PT_view, REBOUND_PT_preview, REBOUND_PT_output,
-           REBOUND_PT_horizons, REBOUND_PT_object)
+classes = (REBOUND_UL_bodies, REBOUND_UL_bakes, REBOUND_PT_main, REBOUND_PT_bakes,
+           REBOUND_PT_bodies, REBOUND_PT_simulation, REBOUND_PT_time, REBOUND_PT_view,
+           REBOUND_PT_preview, REBOUND_PT_output, REBOUND_PT_horizons, REBOUND_PT_object)

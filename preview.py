@@ -226,7 +226,15 @@ def _draw_view():
 
 
 def sim_time(scene):
-    return (scene.frame_current - scene.frame_start + scene.frame_subframe) * scene.rebound.time_per_frame
+    cur = scene.frame_current + scene.frame_subframe
+    if scene.rebound.baked and "rb_sim_t0" in scene and "rb_sim_t1" in scene:
+        f0 = float(scene.get("rb_frame_start", scene.frame_start))
+        f1 = float(scene.get("rb_frame_end", scene.frame_end))
+        t0 = float(scene["rb_sim_t0"])
+        t1 = float(scene["rb_sim_t1"])
+        span = max(1.0, f1 - f0)
+        return t0 + ((cur - f0) / span) * (t1 - t0)
+    return (cur - scene.frame_start) * scene.rebound.time_per_frame
 
 
 def _draw_hud():

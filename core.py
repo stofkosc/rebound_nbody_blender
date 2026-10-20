@@ -8,10 +8,16 @@ Keeping this free of Blender makes it testable with plain Python + REBOUND.
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -33,6 +39,54 @@ UNIT_LABELS = {  # (length, time, mass)
     "AU_DAY_MSUN": ("AU", "d", "Msun"),
     "SI": ("m", "s", "kg"),
 }
+
+# Standard gravitational constants in each unit system (fallback when REBOUND isn't queried)
+DEFAULT_G_BY_UNITS = {
+    "AU_YR2PI_MSUN": 1.0,
+    "AU_YR_MSUN": 4.0 * math.pi * math.pi,
+    "AU_DAY_MSUN": 0.00029591220828559104,
+    "SI": 6.6743e-11,
+}
+
+# Seconds in standard physical time units
+_SECONDS_PER_UNIT = {
+    "SEC": 1.0,
+    "DAY": 86400.0,
+    "YR": 365.25 * 86400.0,
+    "KYR": 1e3 * 365.25 * 86400.0,
+    "MYR": 1e6 * 365.25 * 86400.0,
+}
+
+# Seconds per 1 simulation time unit for each real unit system
+_SIM_TIME_IN_SECONDS = {
+    "AU_YR2PI_MSUN": (365.25 * 86400.0) / TWO_PI,
+    "AU_YR_MSUN": 365.25 * 86400.0,
+    "AU_DAY_MSUN": 86400.0,
+    "SI": 1.0,
+}
+
+
+def time_unit_factor(sim_units: str, chosen_unit: str) -> float:
+    """Return how many simulation time units equal 1 ``chosen_unit``
+    ('SIM', 'YR', 'KYR', 'MYR', 'DAY', 'SEC')."""
+    if not chosen_unit or chosen_unit == "SIM" or sim_units == "CODE":
+        if sim_units == "CODE" and chosen_unit in {"KYR", "MYR"}:
+            return 1e3 if chosen_unit == "KYR" else 1e6
+        return 1.0
+    sim_sec = _SIM_TIME_IN_SECONDS.get(sim_units)
+    target_sec = _SECONDS_PER_UNIT.get(chosen_unit)
+    if sim_sec and target_sec:
+        return target_sec / sim_sec
+    return 1.0
+
+
+def time_unit_label(sim_units: str, chosen_unit: str) -> str:
+    if not chosen_unit or chosen_unit == "SIM":
+        return UNIT_LABELS.get(sim_units, ("L", "T", "M"))[1]
+    labels = {"YR": "yr", "KYR": "kyr", "MYR": "Myr", "DAY": "d", "SEC": "s"}
+    if sim_units == "CODE" and chosen_unit not in {"KYR", "MYR"}:
+        return UNIT_LABELS["CODE"][1]
+    return labels.get(chosen_unit, chosen_unit)
 
 ADAPTIVE_INTEGRATORS = {"ias15", "bs"}
 
@@ -389,6 +443,88 @@ def min_period(spec: SimSpec, order, G, bpos, bvel, bmass):
         if M > 0:
             periods.append(TWO_PI * math.sqrt(sw.a_min ** 3 / (G * M)))
     return min(periods) if periods else None
+
+
+def characteristic_period(spec: SimSpec, body_name: Optional[str] = None,
+                          G_override: Optional[float] = None) -> Optional[float]:
+    """Pure-Python orbital period estimator for ``spec`` (no REBOUND C call required).
+
+    If ``body_name`` is given and bound, returns that body's initial orbital period.
+    Otherwise returns the shortest bound orbital period in ``spec`` (or ``None``).
+    """
+    if not spec.bodies:
+        return None
+    G = float(G_override if G_override is not None else (
+        DEFAULT_G_BY_UNITS.get(spec.units, spec.G) if spec.units != "CODE" else spec.G
+    ))
+    if G <= 0:
+        return None
+    try:
+        order = build_order(spec.bodies)
+    except SetupError:
+        order = [b.slot for b in spec.bodies]
+    by_slot = {b.slot: b for b in spec.bodies}
+    B = max(by_slot.keys()) + 1
+    bpos = np.zeros((B, 3), dtype=np.float64)
+    bvel = np.zeros((B, 3), dtype=np.float64)
+    bmass = np.zeros(B, dtype=np.float64)
+    placed_slots: List[int] = []
+    period_by_name = {}
+
+    for slot in order:
+        b = by_slot[slot]
+        bmass[slot] = max(0.0, float(b.mass))
+        if b.mode == "CARTESIAN" or not placed_slots:
+            bpos[slot] = [float(x) for x in b.pos]
+            bvel[slot] = [float(x) for x in b.vel]
+        else:
+            ref_slots = [b.primary] if (b.primary is not None and b.primary in by_slot) else [
+                s for s in placed_slots if bmass[s] > 0
+            ]
+            M = float(bmass[ref_slots].sum()) if ref_slots else 0.0
+            if M > 0:
+                rp = (bpos[ref_slots] * bmass[ref_slots, None]).sum(0) / M
+                rv = (bvel[ref_slots] * bmass[ref_slots, None]).sum(0) / M
+                mu = G * (M + bmass[slot])
+                if b.a > 0 and 0 <= b.e < 1:
+                    period_by_name[b.name] = TWO_PI * math.sqrt(b.a ** 3 / mu)
+                    if b.anomaly_type == "l":
+                        lam = float(b.anomaly)
+                    elif b.anomaly_type == "M":
+                        lam = float(b.Omega + b.omega + b.anomaly)
+                    else:
+                        lam = float(b.Omega + b.omega + b.anomaly)
+                    rel_p, rel_v = elements_to_cartesian(
+                        mu, max(b.a, 1e-12), min(max(b.e, 0.0), 0.999),
+                        b.inc, b.Omega, b.omega, lam
+                    )
+                    bpos[slot] = rp + rel_p
+                    bvel[slot] = rv + rel_v
+        placed_slots.append(slot)
+
+    refs = orbit_refs(spec, order)
+    for b in spec.bodies:
+        if b.name in period_by_name:
+            continue
+        slots = refs.get(b.slot)
+        if not slots:
+            continue
+        mr = bmass[slots]
+        M = float(mr.sum())
+        if M <= 0:
+            continue
+        rp = (bpos[slots] * mr[:, None]).sum(0) / M
+        rv = (bvel[slots] * mr[:, None]).sum(0) / M
+        mu = G * (M + bmass[b.slot])
+        a, e, *_ = two_body_elements(bpos[b.slot] - rp, bvel[b.slot] - rv, mu)
+        if np.isfinite(a) and a > 0 and e < 1:
+            period_by_name[b.name] = TWO_PI * math.sqrt(float(a) ** 3 / mu)
+
+    if body_name and body_name in period_by_name:
+        return period_by_name[body_name]
+    return min_period(spec, order, G, bpos, bvel, bmass) or (
+        min(period_by_name.values()) if period_by_name else None
+    )
 
 
 # --------------------------------------------------------------------------
@@ -806,6 +942,412 @@ def merge_chunk_results(spec: SimSpec, chunks: List[dict], wall: float = 0.0) ->
     )
 
 
+MIN_PARTICLES_PER_WORKER = 200
+
+
+def default_worker_count() -> int:
+    cpus = os.cpu_count() or 4
+    return max(1, min(16, cpus - 2 if cpus > 4 else cpus))
+
+
+def resolve_worker_count(spec: SimSpec, requested: int = 0, parallel: bool = True,
+                         min_per_worker: int = MIN_PARTICLES_PER_WORKER) -> int:
+    """Choose the effective number of parallel worker processes for ``spec``."""
+    if not parallel:
+        return 1
+    S_total = sum(max(0, int(sw.count)) for sw in spec.swarms)
+    if S_total < 2 * max(1, min_per_worker):
+        return 1
+    target = int(requested) if int(requested) > 0 else default_worker_count()
+    max_by_size = max(1, S_total // max(1, min_per_worker))
+    return max(1, min(target, max_by_size))
+
+
+class ParallelPool:
+    """Manages K worker subprocesses running ``worker.py`` (pure Python, no ``bpy``)."""
+
+    def __init__(self, spec: SimSpec, n_workers: int, n_probes: int = 8,
+                 compute_energy: bool = True, deps_dir: Optional[str] = None):
+        self.spec = spec
+        self.specs = split_specs(spec, n_workers, n_probes=n_probes)
+        self.n_workers = len(self.specs)
+        self.tmpdir = tempfile.mkdtemp(prefix="rebound_bake_")
+        self.procs: List[subprocess.Popen] = []
+        self.out_paths: List[str] = []
+        self.prog_paths: List[str] = []
+        self.err_files = []
+        self._merged: Optional[MergedRun] = None
+        self.archive_error: Optional[str] = None
+
+        worker_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker.py")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        try:
+            for idx, sp in enumerate(self.specs):
+                spec_path = os.path.join(self.tmpdir, f"spec_{idx}.json")
+                out_path = os.path.join(self.tmpdir, f"out_{idx}.npz")
+                prog_path = os.path.join(self.tmpdir, f"prog_{idx}.txt")
+                err_path = os.path.join(self.tmpdir, f"err_{idx}.txt")
+                with open(spec_path, "w", encoding="utf-8") as fh:
+                    json.dump(spec_to_dict(sp), fh)
+                cmd = [sys.executable, worker_py, spec_path, out_path, prog_path]
+                if deps_dir:
+                    cmd.append(deps_dir)
+                if not compute_energy:
+                    cmd.append("--no-energy")
+                err_fh = open(err_path, "w", encoding="utf-8")
+                proc = subprocess.Popen(
+                    cmd, stdout=err_fh, stderr=subprocess.STDOUT,
+                    creationflags=creationflags)
+                self.procs.append(proc)
+                self.out_paths.append(out_path)
+                self.prog_paths.append(prog_path)
+                self.err_files.append((err_fh, err_path))
+        except Exception:
+            self.kill()
+            raise
+
+    def poll_progress(self) -> float:
+        total = 0.0
+        for proc, ppath, (err_fh, err_path) in zip(self.procs, self.prog_paths, self.err_files):
+            rc = proc.poll()
+            if rc is not None and rc != 0:
+                try:
+                    err_fh.flush()
+                    with open(err_path, "r", encoding="utf-8", errors="replace") as fh:
+                        msg = fh.read().strip()
+                except OSError:
+                    msg = f"worker exited with code {rc}"
+                tail = "\n".join(msg.splitlines()[-6:]) if msg else f"exit code {rc}"
+                raise RuntimeError(f"Parallel worker failed:\n{tail}")
+            if rc == 0:
+                total += 1.0
+                continue
+            try:
+                with open(ppath, "r", encoding="utf-8") as fh:
+                    total += float(fh.read().strip() or 0.0)
+            except (OSError, ValueError):
+                pass
+        return total / max(1, len(self.procs))
+
+    @property
+    def done(self) -> bool:
+        return all(p.poll() == 0 for p in self.procs)
+
+    def wait_and_collect(self, wall: float) -> MergedRun:
+        if self._merged is not None:
+            return self._merged
+        for p in self.procs:
+            p.wait()
+        self.poll_progress()  # raises if any worker failed
+        chunks = []
+        for idx, opath in enumerate(self.out_paths):
+            with np.load(opath, allow_pickle=True) as z:
+                if "messages_json" in z:
+                    msgs = json.loads(str(z["messages_json"]))
+                else:
+                    msgs = [str(m) for m in z["messages"].tolist()]
+                c = {
+                    "s_lo": int(z["s_lo"]),
+                    "G": float(z["G"]),
+                    "dt": float(z["dt"]),
+                    "offset0": np.array(z["offset0"], dtype=np.float64),
+                    "bpos": np.array(z["bpos"], dtype=np.float64),
+                    "bvel": np.array(z["bvel"], dtype=np.float64),
+                    "bmass": np.array(z["bmass"], dtype=np.float64),
+                    "brad": np.array(z["brad"], dtype=np.float64),
+                    "energy": np.array(z["energy"], dtype=np.float64),
+                    "halted": bool(z["halted"]),
+                    "wall": float(z["wall"]),
+                    "messages": msgs,
+                    "spos": np.array(z["spos"], dtype=np.float32) if "spos" in z else None,
+                    "ppos": np.array(z["ppos"], dtype=np.float64) if "ppos" in z else None,
+                }
+                if idx == 0 and "archive_error" in z:
+                    ae = str(z["archive_error"])
+                    if ae:
+                        self.archive_error = ae
+                chunks.append(c)
+        self._merged = merge_chunk_results(self.spec, chunks, wall=wall)
+        self.cleanup()
+        return self._merged
+
+    def kill(self):
+        for p in self.procs:
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                except OSError:
+                    pass
+        for p in self.procs:
+            try:
+                p.wait(timeout=1.0)
+            except Exception:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+        self.cleanup()
+
+    def cleanup(self):
+        for err_fh, _ in self.err_files:
+            try:
+                err_fh.close()
+            except OSError:
+                pass
+        if self.tmpdir and os.path.isdir(self.tmpdir):
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
+            self.tmpdir = ""
+
+
+def run_simulation(rebound, spec: SimSpec, n_workers: int = 0, parallel: bool = True,
+                   n_probes: int = 8, compute_energy: bool = True,
+                   progress_cb: Optional[Callable[[float], None]] = None,
+                   deps_dir: Optional[str] = None,
+                   min_per_worker: int = MIN_PARTICLES_PER_WORKER) -> Runner | MergedRun:
+    """Run ``spec`` either in-process or across ``n_workers`` subprocesses.
+
+    Can be called from any standalone Python script or HPC batch job without Blender.
+    """
+    eff_workers = resolve_worker_count(spec, requested=n_workers, parallel=parallel,
+                                       min_per_worker=min_per_worker)
+    t0 = time.perf_counter()
+    if eff_workers > 1:
+        build_simulation(rebound, split_specs(spec, eff_workers, n_probes=0)[0])
+        pool = ParallelPool(spec, eff_workers, n_probes=n_probes,
+                            compute_energy=compute_energy, deps_dir=deps_dir)
+        try:
+            while not pool.done:
+                p = pool.poll_progress()
+                if progress_cb is not None:
+                    progress_cb(p)
+                time.sleep(0.1)
+            run = pool.wait_and_collect(time.perf_counter() - t0)
+            if progress_cb is not None:
+                progress_cb(1.0)
+            return run
+        except BaseException:
+            pool.kill()
+            raise
+    else:
+        runner = Runner(rebound, spec, compute_energy=compute_energy)
+        while not runner.done:
+            p = runner.step(0.25)
+            if progress_cb is not None:
+                progress_cb(p)
+        return runner
+
+
+# --------------------------------------------------------------------------
+# Bake file persistence (.npz) & REBOUND SimulationArchive import (.bin)
+# --------------------------------------------------------------------------
+
+def save_run_npz(path: str, run: Runner | MergedRun, meta: Optional[dict] = None,
+                 compressed: bool = False) -> str:
+    """Save a finished ``Runner`` or ``MergedRun`` (with its ``SimSpec`` and optional
+    Blender/scene metadata) to a portable ``.npz`` file."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    assign_swarm_offsets(run.spec)
+    payload = dict(
+        format_version=np.int64(1),
+        spec_json=np.array(json.dumps(spec_to_dict(run.spec))),
+        meta_json=np.array(json.dumps(meta or {})),
+        messages_json=np.array(json.dumps(list(run.messages))),
+        G=np.float64(run.G),
+        dt=np.float64(run.dt),
+        offset0=np.asarray(run.offset0, dtype=np.float64),
+        bpos=np.asarray(run.bpos, dtype=np.float64),
+        bvel=np.asarray(run.bvel, dtype=np.float64),
+        bmass=np.asarray(run.bmass, dtype=np.float64),
+        brad=np.asarray(run.brad, dtype=np.float64),
+        energy=np.asarray(run.energy, dtype=np.float64),
+        halted=np.bool_(run.halted),
+        wall=np.float64(getattr(run, "wall", 0.0)),
+        n_chunks=np.int64(getattr(run, "n_chunks", 1)),
+    )
+    if run.spos is not None:
+        payload["spos"] = np.asarray(run.spos, dtype=np.float32)
+    split = getattr(run, "split", None)
+    if split is not None:
+        payload["split_n_chunks"] = np.int64(split.n_chunks)
+        payload["split_n_probes"] = np.int64(split.n_probes)
+        payload["split_max_abs_body"] = np.float64(split.max_abs_body)
+        payload["split_max_rel_body"] = np.float64(split.max_rel_body)
+        payload["split_max_abs_probe"] = np.float64(split.max_abs_probe)
+        payload["split_max_rel_probe"] = np.float64(split.max_rel_probe)
+        payload["split_body_drift"] = np.asarray(split.body_drift, dtype=np.float64)
+    saver = np.savez_compressed if compressed else np.savez
+    saver(path, **payload)
+    return path
+
+
+def load_run_npz(path: str) -> Tuple[MergedRun, dict]:
+    """Load a ``.npz`` bake file written by ``save_run_npz``.
+
+    Returns ``(MergedRun, meta_dict)``.
+    """
+    with np.load(path, allow_pickle=False) as z:
+        if "spec_json" not in z:
+            raise SetupError(f"'{os.path.basename(path)}' is not a valid REBOUND bake (.npz missing spec_json).")
+        spec = spec_from_dict(json.loads(str(z["spec_json"])))
+        assign_swarm_offsets(spec)
+        meta = json.loads(str(z["meta_json"])) if "meta_json" in z else {}
+        if "messages_json" in z:
+            messages = json.loads(str(z["messages_json"]))
+        else:
+            messages = []
+        G = float(z["G"])
+        dt = float(z["dt"])
+        offset0 = np.array(z["offset0"], dtype=np.float64)
+        bpos = np.array(z["bpos"], dtype=np.float64)
+        bvel = np.array(z["bvel"], dtype=np.float64)
+        bmass = np.array(z["bmass"], dtype=np.float64)
+        brad = np.array(z["brad"], dtype=np.float64)
+        energy = np.array(z["energy"], dtype=np.float64)
+        halted = bool(z["halted"]) if "halted" in z else False
+        wall = float(z["wall"]) if "wall" in z else 0.0
+        n_chunks = int(z["n_chunks"]) if "n_chunks" in z else 1
+        spos = np.array(z["spos"], dtype=np.float32) if "spos" in z else None
+        split = None
+        if "split_n_chunks" in z:
+            split = SplitCheck(
+                n_chunks=int(z["split_n_chunks"]),
+                n_probes=int(z["split_n_probes"]),
+                max_abs_body=float(z["split_max_abs_body"]),
+                max_rel_body=float(z["split_max_rel_body"]),
+                max_abs_probe=float(z["split_max_abs_probe"]),
+                max_rel_probe=float(z["split_max_rel_probe"]),
+                body_drift=np.array(z["split_body_drift"], dtype=np.float64),
+            )
+    run = MergedRun(
+        spec=spec, G=G, dt=dt, offset0=offset0,
+        bpos=bpos, bvel=bvel, bmass=bmass, brad=brad,
+        spos=spos, energy=energy, messages=messages,
+        halted=halted, wall=wall, split=split, n_chunks=n_chunks,
+    )
+    return run, meta
+
+
+def load_simulation_archive(rebound, path: str, units: str = "CODE",
+                            max_frames: int = 0) -> Tuple[MergedRun, dict]:
+    """Import a native REBOUND ``SimulationArchive`` (``.bin``) into a ``MergedRun``.
+
+    Allows loading simulations produced by arbitrary external REBOUND scripts on
+    university clusters into Blender.
+    """
+    sa_cls = getattr(rebound, "Simulationarchive", None) or getattr(rebound, "SimulationArchive", None)
+    if sa_cls is None:
+        raise SetupError("This REBOUND version does not provide Simulationarchive.")
+    try:
+        sa = sa_cls(path)
+    except Exception as ex:
+        raise SetupError(f"Could not open REBOUND SimulationArchive '{os.path.basename(path)}': {ex}")
+    n_snaps = len(sa)
+    if n_snaps == 0:
+        raise SetupError(f"SimulationArchive '{os.path.basename(path)}' contains 0 snapshots.")
+
+    if max_frames and max_frames > 1 and n_snaps > max_frames:
+        indices = np.linspace(0, n_snaps - 1, int(max_frames), dtype=np.int64)
+    else:
+        indices = np.arange(n_snaps, dtype=np.int64)
+
+    F = len(indices)
+    sim0 = sa[int(indices[0])]
+    N0 = sim0.N
+    if N0 == 0:
+        raise SetupError("SimulationArchive has 0 particles in the first snapshot.")
+
+    x0, v0, m0, r0 = read_particles(sim0)
+    n_active = getattr(sim0, "N_active", -1)
+    if 0 < n_active < N0:
+        B = int(n_active)
+    else:
+        massive_mask = m0 > 0.0
+        n_massive = int(massive_mask.sum())
+        # Treat trailing massless particles as a swarm if there are many (>= 16)
+        if 0 < n_massive < N0 and (N0 - n_massive) >= 16 and np.all(m0[n_massive:] <= 0.0):
+            B = n_massive
+        else:
+            B = N0
+    S = max(0, N0 - B)
+
+    bpos = np.full((F, B, 3), np.nan, dtype=np.float64)
+    bvel = np.full((F, B, 3), np.nan, dtype=np.float64)
+    bmass = np.full((F, B), np.nan, dtype=np.float64)
+    brad = np.full((F, B), np.nan, dtype=np.float64)
+    spos = np.full((F, S, 3), np.nan, dtype=np.float32) if S > 0 else None
+    energy = np.full(F, np.nan, dtype=np.float64)
+    times = np.zeros(F, dtype=np.float64)
+
+    compute_e = N0 <= ENERGY_EVERY_FRAME_MAX_N
+    for k, snap_idx in enumerate(indices):
+        sim = sa[int(snap_idx)]
+        times[k] = float(sim.t)
+        x, v, m, r = read_particles(sim)
+        nb = min(B, len(x))
+        bpos[k, :nb] = x[:nb]
+        bvel[k, :nb] = v[:nb]
+        bmass[k, :nb] = m[:nb]
+        brad[k, :nb] = r[:nb]
+        if S > 0 and len(x) > B:
+            ns = min(S, len(x) - B)
+            spos[k, :ns] = x[B:B + ns].astype(np.float32)
+        if compute_e or k == 0 or k == F - 1:
+            try:
+                energy[k] = float(sim.energy())
+            except Exception:
+                pass
+
+    t_span = float(times[-1] - times[0]) if F > 1 else 0.0
+    tpf = t_span / max(1, F - 1) if t_span > 0 else 0.05
+    G = float(sim0.G)
+    dt = float(getattr(sim0, "dt", 0.01))
+    integrator = str(getattr(sim0, "integrator", "ias15"))
+    if integrator not in {"ias15", "whfast", "mercurius", "trace", "saba", "leapfrog", "janus", "bs"}:
+        integrator = "ias15"
+
+    heaviest = int(np.argmax(m0[:B])) if B > 0 else 0
+    bodies_spec = []
+    for b in range(B):
+        name = "Star" if (b == heaviest and B > 1) else f"Body {b + 1}"
+        bodies_spec.append(BodySpec(
+            slot=b, name=name, mass=float(m0[b]), radius=float(r0[b]),
+            mode="CARTESIAN",
+            pos=(float(x0[b, 0]), float(x0[b, 1]), float(x0[b, 2])),
+            vel=(float(v0[b, 0]), float(v0[b, 1]), float(v0[b, 2])),
+            ref=heaviest if b != heaviest else None,
+            order=b,
+        ))
+    swarms_spec = []
+    if S > 0:
+        swarms_spec.append(SwarmSpec(name="Swarm", count=S, primary=heaviest, first=0))
+
+    spec = SimSpec(
+        bodies=bodies_spec,
+        swarms=swarms_spec,
+        units=units if units in UNIT_SYSTEMS else "CODE",
+        G=G,
+        integrator=integrator,
+        dt_mode="MANUAL",
+        dt=max(dt, 1e-12),
+        time_per_frame=max(tpf, 1e-12),
+        n_frames=F,
+        move_to_com=False,
+    )
+    run = MergedRun(
+        spec=spec, G=G, dt=dt, offset0=np.zeros(3),
+        bpos=bpos, bvel=bvel, bmass=bmass, brad=brad,
+        spos=spos, energy=energy,
+        messages=[f"Imported {F} snapshots from REBOUND SimulationArchive '{os.path.basename(path)}'."],
+    )
+    run.times = times
+    meta = {
+        "label": os.path.splitext(os.path.basename(path))[0],
+        "source_archive": os.path.basename(path),
+    }
+    return run, meta
+
+
 # --------------------------------------------------------------------------
 # Array helpers
 # --------------------------------------------------------------------------
@@ -822,6 +1364,23 @@ def ffill(a):
     idx = np.where(~bad, np.arange(a.shape[0]), 0)
     np.maximum.accumulate(idx, out=idx)
     return a[idx]
+
+
+def interpolate_swarm_frames(P: np.ndarray, target_frames: int) -> np.ndarray:
+    """Linearly resample swarm positions ``P`` of shape ``(K, S, 3)`` onto
+    ``target_frames`` evenly spaced frames ``(F_anim, S, 3)``."""
+    P = np.asarray(P)
+    K = P.shape[0]
+    F_anim = max(1, int(target_frames))
+    if K == F_anim or K <= 1:
+        if K == 1 and F_anim > 1:
+            return np.broadcast_to(P, (F_anim,) + P.shape[1:]).copy()
+        return P
+    u = np.linspace(0.0, float(K - 1), F_anim, dtype=np.float64)
+    i0 = np.clip(np.floor(u).astype(np.int64), 0, K - 1)
+    i1 = np.clip(i0 + 1, 0, K - 1)
+    alpha = (u - i0)[:, None, None]
+    return (1.0 - alpha) * P[i0] + alpha * P[i1]
 
 
 def _normalize(v, fallback):
